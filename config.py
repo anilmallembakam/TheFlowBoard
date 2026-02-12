@@ -4,7 +4,17 @@ Centralized settings for thresholds, API credentials, and display options.
 """
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
+
+# Load .env file from project root if it exists
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass
 
 
 @dataclass
@@ -23,8 +33,8 @@ class APIConfig:
 class IBKRConfig:
     """Interactive Brokers TWS configuration."""
     host: str = "127.0.0.1"
-    port: int = 7497          # TWS paper=7497, live=7496
-    client_id: int = 1        # unique client ID for this connection
+    port: int = 7496          # TWS live=7496, paper=7497
+    client_id: int = 10       # unique client ID for this connection (avoid 0/1 which are commonly used)
     timeout: int = 30         # seconds to wait for data
     readonly: bool = True     # read-only mode (no order placement)
 
@@ -127,6 +137,6 @@ def load_ibkr_config() -> IBKRConfig:
     """Load IBKR config from environment variables."""
     return IBKRConfig(
         host=os.getenv("IBKR_HOST", "127.0.0.1"),
-        port=int(os.getenv("IBKR_PORT", "7497")),
-        client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
+        port=int(os.getenv("IBKR_PORT", "7496")),
+        client_id=int(os.getenv("IBKR_CLIENT_ID", "10")),
     )

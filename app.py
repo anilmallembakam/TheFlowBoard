@@ -14,7 +14,7 @@ from config import (
     SYMBOLS, DEFAULT_SYMBOL, DisplayConfig, ThresholdConfig, ColorConfig,
     MOCK_PRICES, DATA_SOURCES, DEFAULT_DATA_SOURCE,
 )
-from schwab_api import create_api_client, MockSchwabAPI
+from schwab_api import create_api_client, MockSchwabAPI, SchwabAPIClient
 from utils.data_processor import DataProcessor
 from utils.flow_detector import FlowDetector
 
@@ -158,7 +158,7 @@ def init_session_state():
         "auto_refresh": True,
         "symbol": DEFAULT_SYMBOL,
         "data_source": DEFAULT_DATA_SOURCE,
-        "display_mode": "GEX",  # "GEX", "Volume", "OI"
+        "display_mode": "Volume",  # "Volume", "GEX", "OI"
         "display_config": DisplayConfig(),
         "threshold_config": ThresholdConfig(),
         "color_config": ColorConfig(),
@@ -322,6 +322,9 @@ def fetch_data():
     client = st.session_state.api_client
     symbol = st.session_state.symbol
     cfg = st.session_state.display_config
+
+    # Identify actual data source for debugging
+    source_name = type(client).__name__
     try:
         quote = client.get_quote(symbol)
         chain = client.get_option_chain(
@@ -329,6 +332,16 @@ def fetch_data():
             strike_count=cfg.strikes_above_atm + cfg.strikes_below_atm,
             days_to_expiration=cfg.max_dte,
         )
+
+        # Debug: log what we got
+        n_calls = sum(len(v) for v in chain.get("callExpDateMap", {}).values())
+        n_puts = sum(len(v) for v in chain.get("putExpDateMap", {}).values())
+        spot = chain.get("underlying", {}).get("last", 0)
+        st.session_state._debug_info = (
+            f"Source: {source_name} | Spot: {spot} | "
+            f"Call strikes: {n_calls} | Put strikes: {n_puts}"
+        )
+
         processor = st.session_state.processor
         processor.config = cfg
         processed = processor.process_chain(chain)
@@ -338,7 +351,9 @@ def fetch_data():
         processor.save_snapshot(processed, symbol)
         processor.cleanup_old_snapshots(cfg.snapshot_retention_hours)
     except Exception as e:
-        st.error(f"Data fetch error: {e}")
+        import traceback
+        st.error(f"Data fetch error ({source_name}): {e}")
+        st.code(traceback.format_exc(), language="text")
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -403,6 +418,49 @@ def render_sidebar():
                     "IBKR Disconnected</div>",
                     unsafe_allow_html=True,
                 )
+        elif isinstance(client, SchwabAPIClient):
+            if client.is_authenticated:
+                st.markdown(
+                    "<div style='background:#1b3a1b;color:#81c784;padding:6px 12px;"
+                    "border-radius:6px;font-size:0.8rem'>Schwab API Connected</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='background:#3a2a1b;color:#ffb74d;padding:6px 12px;"
+                    "border-radius:6px;font-size:0.8rem'>Schwab — Login Required</div>",
+                    unsafe_allow_html=True,
+                )
+                # Show OAuth login flow
+                if client.is_configured:
+                    auth_url = client.get_auth_url()
+                    st.markdown(
+                        f"**Step 1:** [Click here to login with Schwab]({auth_url})",
+                    )
+                    st.markdown(
+                        "**Step 2:** After login, Schwab redirects to a URL. "
+                        "Paste the **full redirect URL** below:"
+                    )
+                    redirect_url = st.text_input(
+                        "Redirect URL", key="schwab_redirect_url",
+                        placeholder="https://127.0.0.1:8182/callback?code=...",
+                    )
+                    if redirect_url and "code=" in redirect_url:
+                        from urllib.parse import urlparse, parse_qs
+                        parsed = urlparse(redirect_url)
+                        code = parse_qs(parsed.query).get("code", [None])[0]
+                        if code:
+                            with st.spinner("Exchanging auth code..."):
+                                if client.exchange_code(code):
+                                    st.success("Authenticated!")
+                                    st.rerun()
+                                else:
+                                    st.error("Token exchange failed. Check credentials.")
+                else:
+                    st.warning(
+                        "Set SCHWAB_CLIENT_ID and SCHWAB_CLIENT_SECRET "
+                        "environment variables or in a .env file."
+                    )
         else:
             st.markdown(
                 "<div style='background:#1b2a3a;color:#90caf9;padding:6px 12px;"
@@ -440,7 +498,7 @@ def render_sidebar():
 
         # ── Display Mode selector ──
         st.markdown("**Display Mode**")
-        display_modes = ["GEX", "Volume", "OI"]
+        display_modes = ["Volume", "GEX", "OI"]
         current_mode_idx = display_modes.index(st.session_state.display_mode) \
             if st.session_state.display_mode in display_modes else 0
         display_mode = st.selectbox(
@@ -564,9 +622,15 @@ def build_heatmap_html(processed_data: dict) -> str:
     use_int_strikes = all(s == int(s) for s in strikes)
 
     # Mode-specific labels
-    mode_label = display_mode
-    dte_label = f"0-30 DTE {mode_label}"
-    bar_label = f"Net {mode_label}"
+    if display_mode == "Volume":
+        dte_label = "0-30 DTE"
+        bar_label = "Net Contracts"
+    elif display_mode == "GEX":
+        dte_label = "0-30 DTE GEX"
+        bar_label = "Net GEX"
+    else:  # OI
+        dte_label = "0-30 DTE OI"
+        bar_label = "Net OI"
 
     # ── Header row ───────────────────────────────────────────────────────
     header_html = "<tr>"
@@ -624,17 +688,15 @@ def build_heatmap_html(processed_data: dict) -> str:
             elif display_mode == "OI":
                 call_oi = cell.get("call_oi", 0)
                 put_oi = cell.get("put_oi", 0)
-                net_oi = call_oi - put_oi
                 total_oi = call_oi + put_oi
                 oi_pct = call_oi / total_oi if total_oi > 0 else 0.5
                 bg = get_cell_bg(oi_pct, total_oi, is_atm)
-                val = format_vol(net_oi)
+                val = format_vol(total_oi)  # show TOTAL OI, color shows direction
             else:  # Volume
-                net = cell.get("net_volume", 0)
                 total = cell.get("total_volume", 0)
                 call_pct = cell.get("call_pct", 0.5)
                 bg = get_cell_bg(call_pct, total, is_atm)
-                val = format_vol(net)
+                val = format_vol(total)  # show TOTAL volume, color shows direction
 
             txt_color = "#e0e0e0" if val != "-" else "#555"
             row += f'<td style="background:{bg};color:{txt_color}">{val}</td>'
@@ -652,17 +714,17 @@ def build_heatmap_html(processed_data: dict) -> str:
             dte_bg = get_gex_cell_bg(dte_gex, max_gex, is_atm)
             dte_txt_color = "#6fbf73" if dte_gex > 0 else "#e57373" if dte_gex < 0 else "#555"
         elif display_mode == "OI":
-            dte_net_oi = agg["call_oi"] - agg["put_oi"]
             dte_total_oi = agg["call_oi"] + agg["put_oi"]
-            dte_val = format_vol(dte_net_oi)
-            dte_bg = get_dte_cell_bg(dte_net_oi, dte_total_oi)
-            dte_txt_color = "#6fbf73" if dte_net_oi > 0 else "#e57373" if dte_net_oi < 0 else "#555"
+            dte_call_pct = agg["call_oi"] / dte_total_oi if dte_total_oi > 0 else 0.5
+            dte_val = format_vol(dte_total_oi)
+            dte_bg = get_cell_bg(dte_call_pct, dte_total_oi, is_atm)
+            dte_txt_color = "#e0e0e0" if dte_total_oi > 0 else "#555"
         else:  # Volume
-            dte_net = agg["call_vol"] - agg["put_vol"]
             dte_total = agg["call_vol"] + agg["put_vol"]
-            dte_bg = get_dte_cell_bg(dte_net, dte_total)
-            dte_val = format_vol(dte_net)
-            dte_txt_color = "#6fbf73" if dte_net > 0 else "#e57373" if dte_net < 0 else "#555"
+            dte_call_pct = agg["call_vol"] / dte_total if dte_total > 0 else 0.5
+            dte_bg = get_cell_bg(dte_call_pct, dte_total, is_atm)
+            dte_val = format_vol(dte_total)
+            dte_txt_color = "#e0e0e0" if dte_total > 0 else "#555"
 
         if is_atm:
             dte_bg = "#2e2e16"
@@ -824,11 +886,16 @@ def main():
 
     render_sidebar()
 
-    # Timestamp header
+    # Timestamp header + data source debug info
     now = datetime.now()
+    client = st.session_state.api_client
+    source_type = type(client).__name__
+    debug_info = st.session_state.get("_debug_info", "")
     st.markdown(
         f"<div style='color:#888;font-family:monospace;font-size:0.85rem;"
-        f"padding:4px 0'>{now.strftime('%a %b %d, %H:%M:%S')}</div>",
+        f"padding:4px 0'>{now.strftime('%a %b %d, %H:%M:%S')} &nbsp;|&nbsp; "
+        f"<span style='color:#ffeb3b'>{source_type}</span>"
+        f" &nbsp;|&nbsp; {debug_info}</div>",
         unsafe_allow_html=True,
     )
 

@@ -12,6 +12,7 @@ Requirements:
 """
 import asyncio
 import math
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -86,23 +87,42 @@ class IBKRClient:
         if self.is_connected:
             return True
 
-        try:
-            self._ib = IB()
-            self._ib.connect(
-                host=self.config.host,
-                port=self.config.port,
-                clientId=self.config.client_id,
-                readonly=self.config.readonly,
-                timeout=self.config.timeout,
-            )
-            self._connected = True
-            return True
-        except Exception as e:
-            self._connected = False
-            raise ConnectionError(
-                f"Cannot connect to TWS at {self.config.host}:{self.config.port}. "
-                f"Make sure TWS is running with API enabled. Error: {e}"
-            )
+        import random
+
+        # Try up to 3 different client IDs — TWS rejects duplicate client IDs
+        # with Error 326 which surfaces as a TimeoutError in ib_insync
+        client_ids = [self.config.client_id] + [random.randint(100, 999) for _ in range(2)]
+        last_error = None
+
+        for cid in client_ids:
+            try:
+                self._ib = IB()
+                self._ib.connect(
+                    host=self.config.host,
+                    port=self.config.port,
+                    clientId=cid,
+                    readonly=self.config.readonly,
+                    timeout=self.config.timeout,
+                )
+                self._connected = True
+                return True
+            except Exception as e:
+                last_error = e
+                # Clean up failed connection before retrying
+                try:
+                    if self._ib:
+                        self._ib.disconnect()
+                except Exception:
+                    pass
+                self._ib = None
+                continue
+
+        self._connected = False
+        raise ConnectionError(
+            f"Cannot connect to TWS at {self.config.host}:{self.config.port}. "
+            f"Tried client IDs {client_ids}. "
+            f"Make sure TWS is running with API enabled. Error: {last_error}"
+        )
 
     def disconnect(self):
         """Disconnect from TWS."""
@@ -127,6 +147,21 @@ class IBKRClient:
             contract = Stock(symbol, exchange, currency)
         return contract
 
+    def _wait_for_data(self, ticker, timeout: float = 4.0) -> None:
+        """Wait for streaming data to arrive on a ticker, up to timeout seconds."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self._ib.sleep(0.2)
+            # Check if we got a valid price
+            last = _safe_float(ticker.last, 0)
+            close = _safe_float(ticker.close, 0)
+            bid = _safe_float(ticker.bid, 0)
+            ask = _safe_float(ticker.ask, 0)
+            if last > 0 or close > 0 or (bid > 0 and ask > 0):
+                return
+        # Final sleep to collect any remaining data
+        self._ib.sleep(0.5)
+
     def get_quote(self, symbol: str) -> Dict[str, Any]:
         """Get current quote for a symbol. Returns same format as MockSchwabAPI."""
         self._ensure_connected()
@@ -134,9 +169,9 @@ class IBKRClient:
         contract = self._make_underlying(symbol)
         self._ib.qualifyContracts(contract)
 
-        # Request market data
-        ticker = self._ib.reqMktData(contract, genericTickList="", snapshot=True)
-        self._ib.sleep(2)  # wait for data
+        # Use streaming mode — more reliable across paper/live accounts
+        ticker = self._ib.reqMktData(contract, genericTickList="", snapshot=False)
+        self._wait_for_data(ticker, timeout=4.0)
 
         last = _safe_float(ticker.last, _safe_float(ticker.close, 0.0))
         if last == 0:
@@ -179,9 +214,9 @@ class IBKRClient:
         contract = self._make_underlying(symbol)
         self._ib.qualifyContracts(contract)
 
-        # Get underlying price first
-        ticker = self._ib.reqMktData(contract, genericTickList="", snapshot=True)
-        self._ib.sleep(2)
+        # Get underlying price — use streaming for reliability on paper accounts
+        ticker = self._ib.reqMktData(contract, genericTickList="", snapshot=False)
+        self._wait_for_data(ticker, timeout=5.0)
 
         spot = _safe_float(ticker.last, _safe_float(ticker.close, 0.0))
         if spot == 0:
@@ -238,8 +273,8 @@ class IBKRClient:
             except ValueError:
                 continue
 
-        # Limit to 6 nearest expirations
-        valid_expirations = valid_expirations[:6]
+        # Limit to 4 nearest expirations to stay within TWS data line limits
+        valid_expirations = valid_expirations[:4]
 
         # Filter strikes to clean multiples of the symbol's strike interval
         # e.g. SPX → 5-point (6880, 6885, 6890...), SPY → 1-point
@@ -263,8 +298,20 @@ class IBKRClient:
         selected_strikes = clean_strikes[lo:hi]
 
         # Build option contracts and request data
+        # Process ONE expiration at a time, requesting at most 90 market data
+        # lines (45 strikes × call + put) to stay within TWS's 100-line limit.
+        # Cancel ALL lines and wait before moving to the next expiration.
+        MAX_STRIKES_PER_BATCH = 45  # 45 strikes × 2 sides = 90 lines < 100
+
         calls_by_exp: Dict[str, Dict[str, List[Dict]]] = {}
         puts_by_exp: Dict[str, Dict[str, List[Dict]]] = {}
+
+        # If we have more strikes than the batch limit, trim from both ends
+        if len(selected_strikes) > MAX_STRIKES_PER_BATCH:
+            trim = len(selected_strikes) - MAX_STRIKES_PER_BATCH
+            trim_lo = trim // 2
+            trim_hi = trim - trim_lo
+            selected_strikes = selected_strikes[trim_lo: len(selected_strikes) - trim_hi]
 
         for exp_str in valid_expirations:
             exp_key = f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
@@ -291,82 +338,36 @@ class IBKRClient:
                 batch = opt_contracts[i:i + batch_size]
                 try:
                     self._ib.qualifyContracts(*batch)
-                    qualified.extend(batch)
+                    qualified.extend([c for c in batch if c.conId > 0])
                 except Exception:
                     continue
 
             if not qualified:
                 continue
 
-            # Request market data for all options
+            # Request market data for ALL options in this expiration at once
+            # (max 90 lines which is under the 100 limit)
+            # Generic ticks: 100=OI, 106=IV (which provides computed greeks)
             tickers = []
             for opt in qualified:
-                t = self._ib.reqMktData(opt, genericTickList="100,101,104,106", snapshot=True)
+                t = self._ib.reqMktData(opt, genericTickList="100,106", snapshot=False)
                 tickers.append((opt, t))
 
-            # Wait for data to arrive
-            self._ib.sleep(3)
+            # Wait for streaming data — pump the event loop in small steps
+            # so TWS can deliver updates incrementally
+            for _ in range(12):
+                self._ib.sleep(0.5)
 
-            # Process results
-            for opt, ticker in tickers:
-                exp_date = datetime.strptime(
-                    opt.lastTradeDateOrContractMonth, "%Y%m%d"
-                ).date()
-                dte = (exp_date - today).days
-                strike = opt.strike
-                strike_key = f"{strike:.1f}"
-
-                bid = _safe_float(ticker.bid, 0)
-                ask = _safe_float(ticker.ask, 0)
-                last = _safe_float(ticker.last, 0)
-                mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
-                volume = _safe_int(ticker.volume, 0)
-
-                # Model greeks if available
-                greeks = ticker.modelGreeks or ticker.lastGreeks
-                delta = _safe_float(getattr(greeks, 'delta', None), 0) if greeks else 0
-                gamma = _safe_float(getattr(greeks, 'gamma', None), 0) if greeks else 0
-                theta = _safe_float(getattr(greeks, 'theta', None), 0) if greeks else 0
-                vega = _safe_float(getattr(greeks, 'vega', None), 0) if greeks else 0
-                iv = _safe_float(getattr(greeks, 'impliedVol', None), 0) if greeks else 0
-
-                # Open interest from generic tick 101
-                if opt.right == "C":
-                    oi = _safe_int(getattr(ticker, 'callOpenInterest', 0), 0)
-                else:
-                    oi = _safe_int(getattr(ticker, 'putOpenInterest', 0), 0)
-
-                option_type = "CALL" if opt.right == "C" else "PUT"
-                multiplier = _safe_int(opt.multiplier, 100) if opt.multiplier else 100
-
-                contract_data = {
-                    "putCall": option_type,
-                    "symbol": f"{symbol} {exp_str}{opt.right}{strike:.0f}",
-                    "description": f"{symbol} {option_type}",
-                    "bid": round(bid, 2),
-                    "ask": round(ask, 2),
-                    "last": round(last, 2),
-                    "mark": round(mid, 2),
-                    "totalVolume": volume,
-                    "openInterest": int(oi),
-                    "strikePrice": strike,
-                    "daysToExpiration": dte,
-                    "volatility": round(iv * 100, 2),
-                    "delta": round(delta, 4),
-                    "gamma": round(gamma, 4),
-                    "theta": round(theta, 4),
-                    "vega": round(vega, 4),
-                    "multiplier": multiplier,
-                    "inTheMoney": (option_type == "CALL" and strike < spot)
-                                  or (option_type == "PUT" and strike > spot),
-                }
-
-                if opt.right == "C":
-                    calls_by_exp[exp_key][strike_key] = [contract_data]
-                else:
-                    puts_by_exp[exp_key][strike_key] = [contract_data]
-
+            # Process results and cancel ALL market data for this expiration
+            for opt, tkr in tickers:
+                self._process_option_ticker(
+                    opt, tkr, exp_str, today, spot, symbol,
+                    calls_by_exp, puts_by_exp,
+                )
                 self._ib.cancelMktData(opt)
+
+            # Wait for cancellations to fully process before next expiration
+            self._ib.sleep(1.0)
 
         return {
             "symbol": symbol,
@@ -379,6 +380,69 @@ class IBKRClient:
             "callExpDateMap": calls_by_exp,
             "putExpDateMap": puts_by_exp,
         }
+
+    def _process_option_ticker(
+        self, opt, ticker, exp_str: str, today, spot: float, symbol: str,
+        calls_by_exp: Dict, puts_by_exp: Dict,
+    ):
+        """Extract data from a single option ticker and add to result dicts."""
+        exp_key = f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
+        exp_date = datetime.strptime(
+            opt.lastTradeDateOrContractMonth, "%Y%m%d"
+        ).date()
+        dte = (exp_date - today).days
+        strike = opt.strike
+        strike_key = f"{strike:.1f}"
+
+        bid = _safe_float(ticker.bid, 0)
+        ask = _safe_float(ticker.ask, 0)
+        last = _safe_float(ticker.last, 0)
+        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+        volume = _safe_int(ticker.volume, 0)
+
+        # Model greeks — modelGreeks are computed by TWS, lastGreeks are from exchange
+        greeks = ticker.modelGreeks or ticker.lastGreeks
+        delta = _safe_float(getattr(greeks, 'delta', None), 0) if greeks else 0
+        gamma = _safe_float(getattr(greeks, 'gamma', None), 0) if greeks else 0
+        theta = _safe_float(getattr(greeks, 'theta', None), 0) if greeks else 0
+        vega = _safe_float(getattr(greeks, 'vega', None), 0) if greeks else 0
+        iv = _safe_float(getattr(greeks, 'impliedVol', None), 0) if greeks else 0
+
+        # Open interest from generic tick 100
+        if opt.right == "C":
+            oi = _safe_int(getattr(ticker, 'callOpenInterest', 0), 0)
+        else:
+            oi = _safe_int(getattr(ticker, 'putOpenInterest', 0), 0)
+
+        option_type = "CALL" if opt.right == "C" else "PUT"
+        multiplier = _safe_int(opt.multiplier, 100) if opt.multiplier else 100
+
+        contract_data = {
+            "putCall": option_type,
+            "symbol": f"{symbol} {exp_str}{opt.right}{strike:.0f}",
+            "description": f"{symbol} {option_type}",
+            "bid": round(bid, 2),
+            "ask": round(ask, 2),
+            "last": round(last, 2),
+            "mark": round(mid, 2),
+            "totalVolume": volume,
+            "openInterest": int(oi),
+            "strikePrice": strike,
+            "daysToExpiration": dte,
+            "volatility": round(iv * 100, 2),
+            "delta": round(delta, 4),
+            "gamma": round(gamma, 4),
+            "theta": round(theta, 4),
+            "vega": round(vega, 4),
+            "multiplier": multiplier,
+            "inTheMoney": (option_type == "CALL" and strike < spot)
+                          or (option_type == "PUT" and strike > spot),
+        }
+
+        if opt.right == "C":
+            calls_by_exp[exp_key][strike_key] = [contract_data]
+        else:
+            puts_by_exp[exp_key][strike_key] = [contract_data]
 
     def _empty_chain(self, symbol: str, spot: float = 0) -> Dict[str, Any]:
         return {
